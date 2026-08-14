@@ -1,0 +1,7 @@
+# movie_library_watcher.py dependencies (checked against actual imports).
+requests>=2.28
+Pillow>=10.0
+
+# Optional but recommended: instant new-folder detection via OS filesystem events.
+# Without it the watcher still works, falling back to a 10-second polling sweep.
+watchdog>=3.0

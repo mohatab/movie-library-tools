@@ -1,0 +1,2 @@
+# build_movie_picker.py dependencies (checked against actual imports).
+requests>=2.28
