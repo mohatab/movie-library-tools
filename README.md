@@ -8,9 +8,11 @@ posters, generated dashboards, or watcher state are checked in.
   browsable dashboard (search/filter/sort) with TMDB metadata and Letterboxd ratings.
 - **[Movie Watcher](movie-watcher/)** — watches the library folder for newly added movies and
   automatically sets a poster-based folder icon and finds an Arabic subtitle, without ever
-  touching movies that existed before it was started.
+  touching movies that existed before it was started. After new movie(s) finish, it also
+  triggers a Movie Picker rebuild so the dashboard stays current automatically.
 
-The two are intentionally separate and don't call into each other.
+The two tools' matching/rendering logic stays fully separate — the watcher runs the picker as
+an ordinary subprocess, never importing or duplicating its TMDB/Letterboxd/HTML code.
 
 ## Movie Picker
 
@@ -44,6 +46,8 @@ automatically:
 - Never renames or modifies the video file, and never renames the movie folder.
 - Persists state so it survives restarts and never reprocesses a folder.
 - Single-instance locked: a second launch refuses to run rather than race the first.
+- Triggers a coalesced, failure-isolated Movie Picker rebuild after new movie(s) complete —
+  see [movie-watcher/README.md](movie-watcher/README.md#movie-picker-auto-update).
 
 ```powershell
 python movie-watcher/movie_library_watcher.py                 # continuous watch
@@ -93,7 +97,8 @@ python -m pip install -r movie-watcher/requirements.txt
 
 Then:
 1. Copy `movie-picker/build_movie_picker.py` into the root of your movie library (it scans
-   whatever folder it's placed in).
+   whatever folder it's placed in — and the watcher expects to find it right there, next to
+   itself, in order to auto-trigger dashboard rebuilds).
 2. If your library root isn't `D:\Movies`, edit the `LIBRARY_ROOT` constant near the top of
    `movie-watcher/movie_library_watcher.py` to match.
 3. Set `TMDB_API_KEY` (and `SUBDL_API_KEY` for subtitles) as described above.

@@ -24,6 +24,7 @@ import sys
 import json
 import time
 import html
+import hashlib
 import unicodedata
 import datetime as dt
 from difflib import SequenceMatcher
@@ -48,6 +49,7 @@ OUT_JSON = os.path.join(MOVIES_ROOT, "movie-picker.json")
 OUT_HTML = os.path.join(MOVIES_ROOT, "movie-picker.html")
 CACHE_DIR = os.path.join(MOVIES_ROOT, "cache", "letterboxd")
 POSTER_DIR = os.path.join(MOVIES_ROOT, "cache", "posters")
+CACHE_DIR_TMDB = os.path.join(MOVIES_ROOT, "cache", "tmdb")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 POSTER_BASE = "https://image.tmdb.org/t/p/w500"
@@ -253,6 +255,53 @@ def scan_input():
         if os.path.isdir(trilogy):
             scan_franchise_dir(trilogy, records)
     return records
+
+
+# ----------------------------------------------------------------------------
+# TMDB match cache
+#
+# A resolved match/details result is cached forever once positive (same policy as the
+# Letterboxd cache below: only negative results ever expire). This is what makes a rerun
+# cheap after one new movie is added - the ~100 already-resolved films cost zero TMDB
+# requests, only the new folder(s) do.
+#
+# Cache key is folder + source video filename, NOT folder alone: scan_franchise_dir()
+# gives every film inside a "#Movies Trilogy/<Franchise>/" folder the SAME folder path
+# (each video is its own film sharing one directory), so folder alone would collide and
+# serve one film's cached TMDB match to a different film in the same franchise folder.
+# ----------------------------------------------------------------------------
+
+def tmdb_cache_key(rec):
+    return f"{rec['input']['folder']}|{rec['input']['source_file']}"
+
+
+def tmdb_cache_filename(key):
+    # Hashed rather than sanitised-and-truncated like the Letterboxd cache: composite
+    # keys carry '|' plus arbitrary folder/filename characters, and a hash sidesteps
+    # needing a second sanitisation scheme just for this cache.
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:24] + ".json"
+
+
+def tmdb_cache_path(key):
+    return os.path.join(CACHE_DIR_TMDB, tmdb_cache_filename(key))
+
+
+def tmdb_cache_read(key):
+    p = tmdb_cache_path(key)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def tmdb_cache_write(key, entry):
+    os.makedirs(CACHE_DIR_TMDB, exist_ok=True)
+    entry = dict(entry, cache_key=key)   # self-describing, for auditability on disk
+    with open(tmdb_cache_path(key), "w", encoding="utf-8") as f:
+        json.dump(entry, f, indent=2, ensure_ascii=False)
 
 
 # ----------------------------------------------------------------------------
@@ -1414,6 +1463,33 @@ def render_html(payload):
 # Main
 # ----------------------------------------------------------------------------
 
+def write_text_with_retry(path, text, attempts=8, first_delay=0.5):
+    """Write text to path via a temp file + atomic replace, retrying on PermissionError.
+
+    Observed live: something (antivirus/indexer are the usual suspects on Windows)
+    can hold a read/scan handle on this file for MINUTES after it was last written,
+    denying a plain open(path, "w") the whole time. Writing to a differently-named
+    temp file sidesteps that handle entirely - it isn't holding a lock on a file that
+    doesn't exist yet - and os.replace() only needs to briefly rename over the target,
+    which succeeds even while another process holds a read-only handle open on it.
+    The retry loop remains as a second line of defense for the rename step itself.
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    delay = first_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            log(f"    {path} busy (attempt {attempt}/{attempts}), retrying in {delay:.1f}s")
+            time.sleep(delay)
+            delay *= 2
+
+
 def render_only():
     """Rebuild the HTML from the existing JSON. No TMDB, no Letterboxd, no key.
 
@@ -1424,8 +1500,7 @@ def render_only():
         sys.exit(f"No dataset at {OUT_JSON}. Run a full build first.")
     with open(OUT_JSON, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    with open(OUT_HTML, "w", encoding="utf-8") as f:
-        f.write(render_html(payload))
+    write_text_with_retry(OUT_HTML, render_html(payload))
     log(f"Re-rendered {OUT_HTML} from {OUT_JSON} ({len(payload['movies'])} films, "
         f"no network requests)")
 
@@ -1456,6 +1531,7 @@ def main():
 
     issues = []
     disambiguations = []
+    tmdb_cache_hits = 0
 
     for n, rec in enumerate(records, 1):
         title = rec["input"]["title"]
@@ -1466,59 +1542,84 @@ def main():
             issues.append({"title": title, "kind": "input", "detail": note})
 
         # --- TMDB -----------------------------------------------------------
-        override = TMDB_ID_OVERRIDES.get(title)
-        if override:
-            chosen, disamb, n_plausible = {"id": override["id"]}, None, 1
-            rec["match_method"] = "manual-tmdb-id"
-            rec["match_note"] = override["reason"]
-            log(f"    using manual TMDB id override {override['id']}")
-            issues.append({"title": title, "kind": "manual-override",
-                           "detail": override["reason"]})
+        cache_key = tmdb_cache_key(rec)
+        cached = tmdb_cache_read(cache_key)
+
+        if cached:
+            details = cached["details"]
+            disamb = cached.get("disambiguation")
+            rec["match_method"] = cached.get("match_method", "search")
+            if cached.get("match_note"):
+                rec["match_note"] = cached["match_note"]
+            tmdb_cache_hits += 1
+            log(f"    using cached TMDB match {cached['tmdb_id']}")
         else:
-            rec["match_method"] = "search"
+            override = TMDB_ID_OVERRIDES.get(title)
+            if override:
+                chosen, disamb, n_plausible = {"id": override["id"]}, None, 1
+                rec["match_method"] = "manual-tmdb-id"
+                rec["match_note"] = override["reason"]
+                log(f"    using manual TMDB id override {override['id']}")
+                issues.append({"title": title, "kind": "manual-override",
+                               "detail": override["reason"]})
+            else:
+                rec["match_method"] = "search"
+                try:
+                    chosen, disamb, n_plausible = pick_tmdb_match(tmdb, rec)
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    log(f"    TMDB lookup failed: {type(e).__name__}")
+                    chosen, disamb, n_plausible = None, None, 0
+                    issues.append({"title": title, "kind": "tmdb-error",
+                                   "detail": f"{type(e).__name__} during search"})
+
+            if not chosen:
+                rec["tmdb"] = None
+                rec["letterboxd"] = {
+                    "slug": None, "rating": None, "rating_count": None,
+                    "rating_scale": 5, "status": "unavailable",
+                    "reason": "no TMDB match, so no canonical title/year to match on",
+                    "url": None,
+                }
+                rec["match_status"] = "unmatched"
+                rec["disambiguated"] = False
+                log("    -> NO TMDB MATCH")
+                issues.append({"title": title, "kind": "unmatched",
+                               "detail": "no sufficiently plausible TMDB candidate"})
+                continue
+
             try:
-                chosen, disamb, n_plausible = pick_tmdb_match(tmdb, rec)
-            except SystemExit:
-                raise
+                details = fetch_tmdb_details(tmdb, chosen["id"])
             except Exception as e:
-                log(f"    TMDB lookup failed: {type(e).__name__}")
-                chosen, disamb, n_plausible = None, None, 0
+                details = None
+                log(f"    TMDB details failed: {type(e).__name__}")
+
+            if not details:
+                rec["tmdb"] = None
+                rec["letterboxd"] = {
+                    "slug": None, "rating": None, "rating_count": None,
+                    "rating_scale": 5, "status": "unavailable",
+                    "reason": "TMDB details request failed", "url": None,
+                }
+                rec["match_status"] = "unmatched"
+                rec["disambiguated"] = bool(disamb)
                 issues.append({"title": title, "kind": "tmdb-error",
-                               "detail": f"{type(e).__name__} during search"})
+                               "detail": "details endpoint returned nothing"})
+                continue
 
-        if not chosen:
-            rec["tmdb"] = None
-            rec["letterboxd"] = {
-                "slug": None, "rating": None, "rating_count": None,
-                "rating_scale": 5, "status": "unavailable",
-                "reason": "no TMDB match, so no canonical title/year to match on",
-                "url": None,
-            }
-            rec["match_status"] = "unmatched"
-            rec["disambiguated"] = False
-            log("    -> NO TMDB MATCH")
-            issues.append({"title": title, "kind": "unmatched",
-                           "detail": "no sufficiently plausible TMDB candidate"})
-            continue
-
-        try:
-            details = fetch_tmdb_details(tmdb, chosen["id"])
-        except Exception as e:
-            details = None
-            log(f"    TMDB details failed: {type(e).__name__}")
-
-        if not details:
-            rec["tmdb"] = None
-            rec["letterboxd"] = {
-                "slug": None, "rating": None, "rating_count": None,
-                "rating_scale": 5, "status": "unavailable",
-                "reason": "TMDB details request failed", "url": None,
-            }
-            rec["match_status"] = "unmatched"
-            rec["disambiguated"] = bool(disamb)
-            issues.append({"title": title, "kind": "tmdb-error",
-                           "detail": "details endpoint returned nothing"})
-            continue
+            # Cache only genuine positive matches - permanently, same policy as the
+            # Letterboxd cache below applies to its "available" entries. Unmatched
+            # films are deliberately NOT cached, so they keep retrying every run in
+            # case a better match becomes findable later (e.g. TMDB adds the title).
+            tmdb_cache_write(cache_key, {
+                "tmdb_id": details["id"],
+                "details": details,
+                "match_method": rec["match_method"],
+                "match_note": rec.get("match_note"),
+                "disambiguation": disamb,
+                "cached_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            })
 
         rec["tmdb"] = details
         rec["match_status"] = "matched"
@@ -1542,7 +1643,8 @@ def main():
                            "detail": "TMDB has no poster"})
 
         log(f"    -> TMDB {details['id']}  {details['title']} ({details['year']})"
-            + ("  [disambiguated]" if disamb else ""))
+            + ("  [disambiguated]" if disamb else "")
+            + ("  [cached]" if cached else ""))
 
         # --- Letterboxd (rating only) ---------------------------------------
         try:
@@ -1640,6 +1742,7 @@ def main():
             "duplicate_copies": sum(len(d["copies"]) for d in duplicates),
             "letterboxd_requests": lb.requests_made,
             "letterboxd_cache_hits": lb.cache_hits,
+            "tmdb_cache_hits": tmdb_cache_hits,
             "elapsed_seconds": round(elapsed, 1),
         },
         "disambiguations": disambiguations,
@@ -1648,14 +1751,13 @@ def main():
         "movies": records,
     }
 
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    with open(OUT_HTML, "w", encoding="utf-8") as f:
-        f.write(render_html(payload))
+    write_text_with_retry(OUT_JSON, json.dumps(payload, indent=2, ensure_ascii=False))
+    write_text_with_retry(OUT_HTML, render_html(payload))
 
     mins, secs = divmod(int(elapsed), 60)
     log("")
-    log(f"TMDB      : {matched} matched, {len(records)-matched} unmatched")
+    log(f"TMDB      : {matched} matched, {len(records)-matched} unmatched "
+        f"({tmdb_cache_hits} from cache, {matched - tmdb_cache_hits} fetched)")
     log(f"Letterboxd: {rated} rated, {len(records)-rated} unrated "
         f"({lb.requests_made} requests, {lb.cache_hits} cache hits)")
     log(f"Disambiguations: {len(disambiguations)}")

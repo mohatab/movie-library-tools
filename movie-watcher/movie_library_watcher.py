@@ -6,6 +6,10 @@ prepares them automatically: TMDB match -> poster -> .ico -> folder icon -> Arab
 CRITICAL RULE: movie folders that already existed when the baseline was established are
 NEVER touched. Only folders that appear after initialization are eligible.
 
+After genuinely new movie(s) finish processing, build_movie_picker.py (in this same
+directory) is invoked as a subprocess to refresh movie-picker.json/html, coalesced with a
+90s debounce and isolated so a dashboard failure never affects a movie's own status.
+
 Modes:
     python movie_library_watcher.py                 # continuous watch
     python movie_library_watcher.py --initialize    # establish baseline only, process nothing
@@ -26,6 +30,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -48,6 +53,16 @@ LOCK_FILE = STATE_DIR / "watcher.lock"
 PID_FILE = STATE_DIR / "watcher.pid"
 STOP_FILE = STATE_DIR / "stop.request"
 LOG_MAX_BYTES = 2 * 1024 * 1024
+
+# Movie Picker auto-update. The picker is invoked as an unmodified subprocess - the
+# watcher never imports or duplicates its TMDB/Letterboxd/HTML logic.
+PICKER_SCRIPT = LIBRARY_ROOT / "build_movie_picker.py"
+PICKER_STATE_FILE = STATE_DIR / "picker_state.json"
+PICKER_LOCK_FILE = STATE_DIR / "picker.lock"
+PICKER_RUN_LOG_FILE = STATE_DIR / "picker_last_run.log"
+PICKER_DEBOUNCE_SECONDS = 90        # coalesce movies that finish close together
+PICKER_TIMEOUT_SECONDS = 20 * 60    # generous ceiling for a cold-cache first run
+PICKER_RETRY_BACKOFF_SECONDS = 5 * 60
 
 STATE_VERSION = 1
 
@@ -232,6 +247,31 @@ def running_watcher_pid() -> int | None:
         return int(PID_FILE.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return 0
+
+
+# --------------------------------------------------------------------------------------
+# Movie Picker dashboard state (separate from per-movie state.json on purpose - a
+# dashboard-rebuild failure must never be able to touch a movie's own record).
+# --------------------------------------------------------------------------------------
+
+
+def load_picker_state() -> dict:
+    default = {"status": None, "last_attempt": None, "last_success": None, "last_error": None}
+    if not PICKER_STATE_FILE.exists():
+        return default
+    try:
+        data = json.loads(PICKER_STATE_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return default
+    default.update(data)
+    return default
+
+
+def save_picker_state(data: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PICKER_STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(PICKER_STATE_FILE)
 
 
 # --------------------------------------------------------------------------------------
@@ -1020,6 +1060,14 @@ class Watcher:
         self.snapshots: dict[str, tuple] = {}
         self.stable_counts: dict[str, int] = {}
         self.first_seen: dict[str, float] = {}
+        # Movie Picker auto-update bookkeeping. Deliberately in-memory only (not
+        # persisted to state.json): if the watcher restarts mid-debounce, a pending
+        # rebuild is dropped rather than risking a stale/duplicated trigger. It will
+        # fire again the next time a genuinely new movie completes.
+        self.picker_dirty = False
+        self.picker_dirty_since: float | None = None
+        self.picker_next_retry_at: float | None = None
+        self.picker_lock = SingleInstance(PICKER_LOCK_FILE)
 
     # -- discovery ---------------------------------------------------------------------
     def discover(self) -> None:
@@ -1121,6 +1169,101 @@ class Watcher:
                 entry.setdefault("errors", []).append(f"unexpected: {type(exc).__name__}: {exc}")
                 self.state.save()
                 log(f"Unexpected error: {type(exc).__name__}: {exc}", folder=name)
+            else:
+                # A folder only ever reaches cycle()'s process_movie() call once - it is
+                # terminal (skipped above) on every subsequent cycle - so this can only
+                # fire once per genuinely new movie. Baseline, vanished, needs_manual_review
+                # and error outcomes never take this branch.
+                if entry.get("status") in ("completed", "completed_with_warnings"):
+                    if not self.picker_dirty:
+                        self.picker_dirty_since = time.time()
+                    self.picker_dirty = True
+        self.maybe_rebuild_picker()
+
+    # -- Movie Picker auto-update --------------------------------------------------------
+    def maybe_rebuild_picker(self) -> None:
+        """Rebuild the Movie Picker dashboard after new movie(s) finish, coalesced and
+        failure-isolated. Runs strictly after this cycle's movies are already saved as
+        completed, so a dashboard failure can never affect a movie's own status."""
+        if not self.picker_dirty:
+            return
+        now = time.time()
+        if now - (self.picker_dirty_since or now) < PICKER_DEBOUNCE_SECONDS:
+            return  # still coalescing - more movies may finish in this window
+        if self.picker_next_retry_at and now < self.picker_next_retry_at:
+            return  # backing off after a recent failure
+
+        if not PICKER_SCRIPT.exists():
+            log(f"Movie Picker rebuild skipped: {PICKER_SCRIPT} not found.")
+            self.picker_dirty = False
+            self.picker_dirty_since = None
+            return
+
+        if not self.picker_lock.acquire():
+            # Already running (or a manual run holds the lock) - stay dirty and retry
+            # on a later cycle rather than stacking a second concurrent rebuild.
+            return
+        try:
+            log("Movie Picker: new movie(s) processed - updating dashboard...")
+            state = load_picker_state()
+            state["last_attempt"] = now_iso()
+            save_picker_state(state)
+
+            try:
+                # self.tmdb_key was already resolved with the registry fallback in
+                # main() - os.environ itself may not carry it (a shell started before
+                # the variable existed won't have inherited it), so it must be injected
+                # explicitly rather than relying on subprocess.run's default inheritance.
+                picker_env = dict(os.environ)
+                picker_env["TMDB_API_KEY"] = self.tmdb_key
+                result = subprocess.run(
+                    [sys.executable, str(PICKER_SCRIPT)],
+                    cwd=str(LIBRARY_ROOT),
+                    capture_output=True,
+                    text=True,
+                    timeout=PICKER_TIMEOUT_SECONDS,
+                    env=picker_env,
+                )
+            except subprocess.TimeoutExpired:
+                self._picker_failed(f"timed out after {PICKER_TIMEOUT_SECONDS}s")
+                return
+            except OSError as exc:
+                self._picker_failed(f"failed to launch: {exc}")
+                return
+
+            try:
+                PICKER_RUN_LOG_FILE.write_text(
+                    redact((result.stdout or "") + "\n" + (result.stderr or "")),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+
+            if result.returncode != 0:
+                tail = redact((result.stderr or result.stdout or "").strip())[-500:]
+                self._picker_failed(f"exit code {result.returncode}: {tail}")
+                return
+
+            self.picker_dirty = False
+            self.picker_dirty_since = None
+            self.picker_next_retry_at = None
+            state = load_picker_state()
+            state.update(status="ok", last_success=now_iso(), last_error=None)
+            save_picker_state(state)
+            log("Movie Picker: dashboard updated (movie-picker.json / movie-picker.html). "
+                f"Details: {PICKER_RUN_LOG_FILE}")
+        finally:
+            self.picker_lock.release()
+
+    def _picker_failed(self, detail: str) -> None:
+        log(f"Movie Picker update failed: {detail}. The movie itself is still marked "
+            f"completed; the dashboard will retry automatically in "
+            f"{PICKER_RETRY_BACKOFF_SECONDS // 60} minutes.")
+        state = load_picker_state()
+        state.update(status="failed", last_error=detail, last_error_at=now_iso())
+        save_picker_state(state)
+        self.picker_next_retry_at = time.time() + PICKER_RETRY_BACKOFF_SECONDS
+        # picker_dirty stays True so it is retried after the backoff.
 
     # -- run ---------------------------------------------------------------------------
     def run(self) -> None:
@@ -1193,6 +1336,13 @@ def cmd_status(state: State) -> None:
     print(f"Library    : {LIBRARY_ROOT}")
     print(f"State      : {STATE_FILE}")
     print(f"Initialized: {state.data.get('initialized_at')}")
+
+    picker = load_picker_state()
+    if picker.get("status") is not None:
+        print(f"Movie Picker: {picker.get('status')}"
+              + (f" - last success {picker.get('last_success')}" if picker.get("last_success") else "")
+              + (f" - last error: {picker.get('last_error')}" if picker.get("status") == "failed" else ""))
+
     print("Status counts:")
     for status, count in sorted(counts.items()):
         print(f"  {status:<30} {count}")

@@ -14,7 +14,17 @@ Turns a folder-per-movie library into a self-contained, offline movie-picker das
   this repository.
 - **Caching**: `cache/letterboxd/_index.json` maps TMDB id → resolved Letterboxd slug so
   reruns make zero Letterboxd requests for films already resolved. `cache/posters/` holds
-  downloaded poster images so the page works offline.
+  downloaded poster images so the page works offline. `cache/tmdb/` caches each film's
+  resolved TMDB match + details, keyed by folder **and** source video filename (not folder
+  alone — a shared franchise folder holds multiple films, so folder-alone would let one
+  film's cached match leak onto another). A cache hit is permanent once positive, so a
+  rerun after adding one new movie only spends TMDB requests on that one movie; every
+  already-resolved film costs zero requests. Only successful matches are cached —
+  previously unmatched films keep retrying every run in case a better match appears later.
+- **Concurrent-write safety**: `movie-picker.json`/`.html` are written via a temp file +
+  atomic replace, with a short retry on `PermissionError` — observed in practice, a Windows
+  antivirus/indexer scan can hold a read lock on a just-written file for several minutes,
+  which a plain in-place write would lose the whole rebuild to.
 
 ## Important: where this script must live
 

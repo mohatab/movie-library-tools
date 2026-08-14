@@ -116,8 +116,37 @@ match method + score, poster/ico/icon/subtitle status, errors, timestamps).
 > and would make an existing folder look new. Use a UTF-8-aware editor, or just delete the file
 > and re-run `--initialize` if no new movies are pending.
 
-The `.movie-watcher` directory starts with a dot, so `build_movie_picker.py` skips it. The two
-systems are completely independent; the watcher never runs the picker build.
+The `.movie-watcher` directory starts with a dot, so `build_movie_picker.py` skips it.
+
+## Movie Picker auto-update
+
+After genuinely new movie(s) finish processing, the watcher runs `build_movie_picker.py`
+(expected next to it, in the library root) as an unmodified subprocess — the two tools'
+logic stays fully separate, the watcher never imports or duplicates any TMDB/Letterboxd/HTML
+code.
+
+* **Coalesced**: waits 90 seconds of quiet after the last new-movie completion before
+  rebuilding, so several movies added close together share one rebuild instead of one each.
+* **Isolated from movie processing**: runs only after a movie's own status is already saved
+  as `completed`/`completed_with_warnings`. A rebuild failure is logged and recorded in
+  `.movie-watcher\picker_state.json` (separate from `state.json`) and retried automatically
+  after a 5-minute backoff — it never changes a movie's own status.
+* **Never touches baseline, `needs_manual_review`, `error`, or `vanished` movies.** `--retry`
+  never triggers a rebuild either — it's a manual, single-movie operation.
+* **Single-flight**: guarded by its own `.movie-watcher\picker.lock`, independent of the
+  watcher's own instance lock, so a slow rebuild can't overlap a second one.
+* **No infinite loop**: the picker only ever writes files/subdirectories at the library root
+  (`movie-picker.json`, `movie-picker.html`, `cache/`) — `cache` is already excluded from
+  new-folder detection (see above), so the picker's own output can never be seen as a new
+  movie.
+* Progress/output from each rebuild is written to `.movie-watcher\picker_last_run.log`
+  (overwritten each run, secrets redacted) so a failure can be diagnosed without bloating
+  `watcher.log`.
+
+**Known limitation:** the pending-rebuild flag is in-memory only, not persisted to disk. If
+the watcher restarts within the 90-second debounce window after a movie completes, that
+pending rebuild is dropped — it isn't lost forever, the next new movie triggers a fresh one,
+but the dashboard can lag by one movie until then.
 
 ## How new folders are detected
 
